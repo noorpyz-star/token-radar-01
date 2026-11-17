@@ -140,11 +140,37 @@ tbody tr[data-selected="true"] { background: rgba(232, 178, 58, 0.09); }
 .cost { color: var(--muted); font-size: 12px; font-family: var(--font-num); }
 .note { margin-top: var(--step-3); padding: var(--step-3) var(--step-4); border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface-2); color: var(--muted); font-size: 13px; }
 
+.picks { margin-top: var(--step-5); }
+.picks h2 { margin-bottom: var(--step-3); }
+.pick-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--step-3); }
+.pick {
+  display: grid; gap: var(--step-1); align-content: start; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-panel);
+  padding: var(--step-4);
+}
+.pick:hover { border-color: var(--accent); }
+.pick-rank { font-family: var(--font-num); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); }
+.pick h3 { font-size: 18px; }
+.pick-value { font-size: 22px; color: var(--accent); font-weight: 600; }
+.pick-why { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.strip { display: flex; flex-wrap: wrap; align-items: center; gap: var(--step-2); padding: var(--step-4) 0 var(--step-2); }
+.chip {
+  min-height: 30px; padding: 0 var(--step-3); border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface-2); color: var(--muted); font-size: 13px;
+}
+.chip:hover { color: var(--ink); border-color: var(--accent); }
+.chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #171204; font-weight: 600; }
+.howto { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
+.howto-list { margin: 0; padding-left: var(--step-5); display: grid; gap: var(--step-2); color: var(--muted); }
+.howto-list li::marker { color: var(--accent); font-family: var(--font-num); }
+.howto-list b { color: var(--ink); font-weight: 600; }
+
 @media (max-width: 900px) {
   .shell { padding: var(--step-4); }
   .lede { grid-template-columns: 1fr; gap: var(--step-4); }
   .facts { border-left: 0; border-top: 1px solid var(--border); padding-left: 0; padding-top: var(--step-4); }
   .field input { min-width: 0; width: 100%; }
+  .pick-grid { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
