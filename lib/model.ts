@@ -7,14 +7,17 @@
 // ratio of the protocols in this very snapshot that already trade, so the model is
 // calibrated by the snapshot, not by a hand-picked constant or a list of names.
 //
-//   value  = TVL x multiple x growth x maturity, rounded to whole dollars
+//   value  = TVL x multiple x growth x maturity x reach, rounded to whole dollars
 //   multiple = median(mcap / TVL) over live-token protocols, exchanges excluded
-//   growth   = 1 + 0.55 x clamp(change_7d, -50%, +100%)
+//   growth   = 1 + 0.75 x clamp(change_7d, -50%, +100%)
 //   maturity = 0.70 + 0.50 x min(age_days, 1460) / 1460
 //              (age from listed_at to the snapshot's as_of; unknown age = 365 days)
+//   reach    = 1 + 0.04 x min(chains - 1, 5)
+//              (a protocol live on more chains reaches more users and more
+//               liquidity; a single-chain protocol scores 1.00)
 //
 // Rows that round to the same dollar are pulled $1 apart so the board is a strict
-// ranking, and every row carries a seven-step farm plan written from its own record
+// ranking, and every row carries an eight-step farm plan written from its own record
 // (category, chain, TVL, age) — no protocol is ever special-cased by name, and no
 // step promises an airdrop or a token.
 
@@ -48,23 +51,27 @@ export interface ModelSettings {
   maturity_range: number;
   maturity_days: number;
   unknown_age_days: number;
+  reach_step: number;
+  reach_max_chains: number;
   multiple_floor: number;
   multiple_cap: number;
 }
 
 export const SETTINGS: ModelSettings = {
-  growth_weight: 0.55,
+  growth_weight: 0.75,
   growth_floor: -50,
   growth_cap: 100,
   maturity_floor: 0.7,
   maturity_range: 0.5,
   maturity_days: 1460,
   unknown_age_days: 365,
+  reach_step: 0.04,
+  reach_max_chains: 5,
   multiple_floor: 0.1,
   multiple_cap: 1.0,
 };
 
-export const MODEL_VERSION = 'radar-median-1';
+export const MODEL_VERSION = 'radar-median-2';
 
 /** How many below-floor pre-token protocols join the watchlist on the board. */
 export const EARLY_ROWS = 160;
@@ -92,6 +99,7 @@ export interface BoardRow {
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
+    reach_multiplier: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -111,6 +119,7 @@ export interface DashboardRow {
   implied_value_usd: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  reach_multiplier: number;
   farm_steps: string[];
 }
 
@@ -199,7 +208,7 @@ export function scoreProtocol(
   asOf: string,
   multiple: number,
   settings: ModelSettings = SETTINGS,
-): { raw: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+): { raw: number; growthPct: number; growthMult: number; maturityMult: number; reachMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const growthPct = clamp(asFinite(protocol.change_7d, 0), settings.growth_floor, settings.growth_cap);
   const growthMult = 1 + (growthPct / 100) * settings.growth_weight;
@@ -207,9 +216,14 @@ export function scoreProtocol(
   const maturityMult =
     settings.maturity_floor +
     (clamp(ageForModel, 0, settings.maturity_days) / settings.maturity_days) * settings.maturity_range;
+  // Reach: one more chain is worth a step, up to five extra chains. A protocol
+  // live on many chains reaches more users and more liquidity than the same TVL
+  // on one chain, and the snapshot's own `chains` list is the whole input.
+  const extraChains = Math.max(0, Math.min(protocol.chains.length - 1, settings.reach_max_chains));
+  const reachMult = round4(1 + extraChains * settings.reach_step);
   // The raw value is scored at full precision; the multipliers are rounded only for display.
-  const raw = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult));
-  return { raw, growthPct, growthMult: round4(growthMult), maturityMult: round4(maturityMult), age };
+  const raw = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * reachMult));
+  return { raw, growthPct, growthMult: round4(growthMult), maturityMult: round4(maturityMult), reachMult, age };
 }
 
 /**
@@ -293,6 +307,7 @@ export function buildBoard(snapshot: Snapshot, settings: ModelSettings = SETTING
       growth_pct: s.growthPct,
       growth_multiplier: s.growthMult,
       maturity_multiplier: s.maturityMult,
+      reach_multiplier: s.reachMult,
       age_days: s.age,
     },
     farm_steps: farmPlan(s.p, s.age).map(renderStep),
@@ -489,7 +504,7 @@ function secondPlayFor(p: SnapshotProtocol): SecondPlay | null {
 }
 
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a time. Every
+ * A protocol's farm plan: eight steps, each an action with a cost and a time. Every
  * step is derived from the protocol's own record (category, chains, TVL, age); no
  * protocol name is ever special-cased, and no step promises an airdrop or a token.
  */
@@ -506,6 +521,20 @@ export function farmPlan(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const second = secondPlay !== null
     ? secondPlay.write(p.name, capital, chain)
     : `Make one more qualifying action on ${p.name} (${chain}) the following week, such as a swap, a vote or a deposit.`;
+  // The fourth step follows the protocol's own footprint: a multi-chain protocol
+  // earns a second-chain repeat, a single-chain one earns a monthly re-check.
+  const fourth: FarmStep =
+    p.chains.length > 1
+      ? {
+          action: `Repeat the main action once on a second chain ${p.name} runs on, ${p.chains[1]}, so the activity is not tied to one chain.`,
+          cost: `about $${Math.round(capital / 2)} moved, and ${gasNote(p.chains[1]!)}`,
+          time: '15 minutes, once',
+        }
+      : {
+          action: `Once a month, re-check ${p.name}'s TVL, its points page and its docs for a new pool, vault or market worth joining.`,
+          cost: 'nothing to check, and only the capital you choose to move',
+          time: '10 minutes a month',
+        };
   return [
     {
       action: `Open a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline on paper.`,
@@ -522,6 +551,7 @@ export function farmPlan(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost: `about $${Math.round(capital / 2)} moved, and ${gas}`,
       time: '10 minutes a week',
     },
+    fourth,
     {
       action: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`,
       cost: `the $${capital} stays in the position`,
@@ -577,6 +607,7 @@ function dashboardRow(row: BoardRow): DashboardRow {
     implied_value_usd: row.implied_value_usd,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    reach_multiplier: row.model.reach_multiplier,
     farm_steps: row.farm_steps,
   };
 }
