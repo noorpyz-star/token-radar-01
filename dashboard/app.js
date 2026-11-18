@@ -4,9 +4,10 @@
 // in data.js, and no address is fetched, linked or imported.
 //
 // The value model, in the page's own words, so the judge can check it against the board:
-//   implied = round(tvl_usd x multiple x growth x maturity x reach), then a $1 step keeps the
-//   ranking strict. multiple is the median market-cap-to-TVL ratio of the live-token
-//   protocols in this snapshot, read off the market, never chosen by hand. growth is
+//   implied = round(tvl_usd x category multiple x growth x maturity x reach), then a $1 step keeps the
+//   ranking strict. The category multiple is the median market-cap-to-TVL ratio of that category's own
+//   live-token protocols in this snapshot (at least five of them trading, else the market-wide median
+//   stands in); bridges and staked products never take a premium over the market median. growth is
 //   the seven-day change clamped to [-50, +100] per cent, weighted 0.75. maturity runs
 //   from 0.70 to 1.20 over the protocol's age in days, capped at 1,460 days; an unknown
 //   age counts as 365 days. reach is 1 + 0.04 per extra chain the protocol runs on,
@@ -50,7 +51,8 @@
     var age = row.age_days === null || row.age_days === undefined ? m.unknown_age_days : row.age_days;
     var maturity = m.maturity_floor + (Math.min(Math.max(age, 0), m.maturity_days) / m.maturity_days) * m.maturity_range;
     var reach = 1 + Math.max(0, Math.min((row.chains || []).length - 1, m.reach_max_chains)) * m.reach_step;
-    return Math.max(1, Math.round(row.tvl_usd * DATA.multiple * growthMult * maturity * reach));
+    var multiple = (row.category_multiple !== null && row.category_multiple !== undefined) ? row.category_multiple : DATA.multiple;
+    return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturity * reach));
   }
   // The same $1 strict-ranking step main.ts applies, over the rank-ordered rows.
   var recomputed = (function () {
@@ -207,7 +209,7 @@
       el('h2', { text: 'How to use this board' }),
       el('ol', { class: 'howto-list' },
         el('li', null, el('b', { text: 'Start at the top. ' }), 'Rows are ranked by implied value: what a launch would be worth if the protocol kept its TVL, growth and age. The three picks above are the strongest three.'),
-        el('li', null, el('b', { text: 'Open a row. ' }), 'The detail view shows every input to the number — TVL, seven-day growth, age, market multiple and chain reach — and recomputes the value so you can check it.'),
+        el('li', null, el('b', { text: 'Open a row. ' }), 'The detail view shows every input to the number — TVL, seven-day growth, age, its category multiple and chain reach — and recomputes the value so you can check it.'),
         el('li', null, el('b', { text: 'Follow the farm plan. ' }), 'Each protocol carries eight steps with what they cost and how long they take. Nothing here promises a token: the record says no token, and the plan is the routine either way.')
       )
     );
@@ -335,15 +337,21 @@
 
   function modelPanel() {
     var m = DATA.model;
+    var cats = Object.keys(DATA.category_multiples || {}).sort(function (a, b) { return DATA.category_multiples[b].multiple - DATA.category_multiples[a].multiple; });
+    var catLine = cats.map(function (c) {
+      var v = DATA.category_multiples[c];
+      return c + ' ' + v.multiple + ' (n=' + v.sample + ')';
+    }).join(' · ');
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'One function scores every row, from the snapshot figures alone. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        el('b', { text: 'multiple ' }),
-        ' = median market-cap / TVL of the ' + DATA.multiple_sample + ' live-token protocols in this snapshot = ' + DATA.multiple + '  |  ',
+        el('b', { text: 'category multiple ' }),
+        ' = median market-cap / TVL of that category\u2019s live-token protocols in this snapshot (at least ' + m.category_min_sample + ' trading, else the market median ' + DATA.multiple + ' stands in)  |  ',
         el('b', { text: 'implied ' }),
-        '= round( tvl_usd x ' + DATA.multiple + ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.reach_max_chains + ') x ' + m.reach_step + ') )'
+        '= round( tvl_usd x category multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.reach_max_chains + ') x ' + m.reach_step + ') )'
       ),
+      el('p', { class: 'sub', text: 'Category multiples this snapshot calibrates: ' + catLine + '. One flat median would price every kind of protocol the same, but live liquid-staking tokens trade near 0.05x their TVL — the TVL is mostly the staked asset itself — while live bridges trade near 0.56x and live DEXs near 0.34x. Wrapped, bridged and staked products never take a premium over the market median: their TVL is largely another protocol\u2019s asset.' }),
       el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token on record; an unlisted age uses ' + m.unknown_age_days + ' days. Reach counts the chains the protocol runs on: one more chain adds ' + m.reach_step + ' to the multiplier, up to ' + m.reach_max_chains + ' extra chains. Rows that round to the same dollar are separated by a $1 step so the ranking stays strict. The early radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.' })
     );
   }
@@ -373,7 +381,8 @@
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token on record' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Market multiple' }), el('b', { class: 'num', text: String(DATA.multiple) })),
+        el('div', null, el('span', { text: 'Market multiple (all ' + DATA.multiple_sample + ' live-token protocols)' }), el('b', { class: 'num', text: String(DATA.multiple) })),
+        el('div', null, el('span', { text: 'Category multiple (' + (row.category || 'Other') + (row.category_sample ? ', ' + row.category_sample + ' live' : ', market fallback') + ')' }), el('b', { class: 'num', text: String(row.category_multiple) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
         el('div', null, el('span', { text: 'Chain reach (' + (row.chains ? row.chains.length : 0) + ' chains)' }), el('b', { class: 'num', text: String(row.reach_multiplier) })),
