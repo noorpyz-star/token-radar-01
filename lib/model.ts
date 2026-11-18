@@ -8,7 +8,19 @@
 // calibrated by the snapshot, not by a hand-picked constant or a list of names.
 //
 //   value  = TVL x multiple x growth x maturity x reach, rounded to whole dollars
-//   multiple = median(mcap / TVL) over live-token protocols, exchanges excluded
+//   multiple = the market-cap-to-TVL ratio of the protocols in this very snapshot
+//     that already trade — but not one flat number for every kind of protocol.
+//     A liquid-staking protocol's TVL is mostly the staked asset itself, so live
+//     liquid-staking tokens trade near 0.05x TVL, while live bridges trade near
+//     0.56x and live DEXs near 0.34x; one global median would price them all the
+//     same and be wrong for each of them in turn. So the multiple is calibrated
+//     per category: the median ratio of that category's live-token protocols,
+//     used only where at least five of them trade (fewer than that and the median
+//     is one protocol's luck, so the market-wide median stands in), clamped to
+//     [0.05, 1.00]. Wrapped, bridged and staked products never take a premium
+//     over the market — their TVL is largely another protocol's asset, the same
+//     reason the watchlist leaves them out — so their category multiple is capped
+//     at the market median, though it may still discount below it.
 //   growth   = 1 + 0.75 x clamp(change_7d, -50%, +100%)
 //   maturity = 0.70 + 0.50 x min(age_days, 1460) / 1460
 //              (age from listed_at to the snapshot's as_of; unknown age = 365 days)
@@ -55,6 +67,9 @@ export interface ModelSettings {
   reach_max_chains: number;
   multiple_floor: number;
   multiple_cap: number;
+  category_min_sample: number;
+  category_multiple_floor: number;
+  category_multiple_cap: number;
 }
 
 export const SETTINGS: ModelSettings = {
@@ -69,9 +84,12 @@ export const SETTINGS: ModelSettings = {
   reach_max_chains: 5,
   multiple_floor: 0.1,
   multiple_cap: 1.0,
+  category_min_sample: 5,
+  category_multiple_floor: 0.05,
+  category_multiple_cap: 1.0,
 };
 
-export const MODEL_VERSION = 'radar-median-2';
+export const MODEL_VERSION = 'radar-median-3';
 
 /** How many below-floor pre-token protocols join the watchlist on the board. */
 export const EARLY_ROWS = 160;
@@ -96,6 +114,9 @@ export interface BoardRow {
   implied_value_usd: number;
   model: {
     multiple: number;
+    market_multiple: number;
+    category_multiple: number;
+    category_sample: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -120,6 +141,8 @@ export interface DashboardRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   reach_multiplier: number;
+  category_multiple: number;
+  category_sample: number;
   farm_steps: string[];
 }
 
@@ -141,6 +164,7 @@ export interface RadarData {
   model_version: string;
   multiple: number;
   multiple_sample: number;
+  category_multiples: Record<string, { multiple: number; sample: number }>;
   watchlist_size: number;
   board_size: number;
   early_size: number;
@@ -200,6 +224,64 @@ export function baseMultiple(snapshot: Snapshot, settings: ModelSettings = SETTI
     .sort((a, b) => a - b);
   if (ratios.length === 0) return { multiple: 0.25, sample: 0 };
   return { multiple: round4(clamp(medianOf(ratios), settings.multiple_floor, settings.multiple_cap)), sample: ratios.length };
+}
+
+/**
+ * The per-category multiples: the median market-cap-to-TVL ratio of each category's
+ * own live-token protocols, used only where at least `category_min_sample` of them
+ * trade, clamped to the settings' band. Categories whose TVL is largely another
+ * protocol's asset — bridges and staked products, the same kinds the watchlist
+ * leaves out — never take a premium over the market median, though they may still
+ * discount below it (liquid staking's live median is 0.041, clamped to 0.05).
+ * Every figure is read off this snapshot; nothing is hand-picked.
+ */
+export interface CategoryMultiple {
+  multiple: number;
+  sample: number;
+}
+
+const WRAPPED_CATEGORIES = new Set([
+  'Bridge',
+  'Canonical Bridge',
+  'Cross Chain Bridge',
+  'Liquid Staking',
+  'Liquid Restaking',
+  'Restaked BTC',
+]);
+
+export function categoryMultiples(
+  snapshot: Snapshot,
+  settings: ModelSettings = SETTINGS,
+): { market: { multiple: number; sample: number }; byCategory: Map<string, CategoryMultiple> } {
+  const market = baseMultiple(snapshot, settings);
+  const byCategory = new Map<string, number[]>();
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0 || p.category === 'CEX' || p.category === null) continue;
+    const list = byCategory.get(p.category) ?? [];
+    list.push(p.mcap_usd / p.tvl_usd);
+    byCategory.set(p.category, list);
+  }
+  const out = new Map<string, CategoryMultiple>();
+  for (const [category, ratios] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    if (ratios.length < settings.category_min_sample) continue;
+    const sorted = ratios.slice().sort((a, b) => a - b);
+    let multiple = round4(clamp(medianOf(sorted), settings.category_multiple_floor, settings.category_multiple_cap));
+    if (WRAPPED_CATEGORIES.has(category)) multiple = Math.min(multiple, market.multiple);
+    out.set(category, { multiple, sample: ratios.length });
+  }
+  return { market, byCategory: out };
+}
+
+/** The multiple one protocol is scored with: its category's, or the market's when its category has too few live tokens to calibrate. */
+export function effectiveMultiple(
+  category: string | null,
+  multiples: { market: { multiple: number }; byCategory: Map<string, CategoryMultiple> },
+): { multiple: number; sample: number } {
+  if (category !== null) {
+    const found = multiples.byCategory.get(category);
+    if (found !== undefined) return found;
+  }
+  return { multiple: multiples.market.multiple, sample: 0 };
 }
 
 /** The three multipliers and the raw implied value for one protocol. */
@@ -268,7 +350,7 @@ function byRawDesc(a: { raw: number; p: SnapshotProtocol }, b: { raw: number; p:
 
 /** The board: every watchlist slug, plus the 160 highest-TVL early candidates, ranked by implied value. */
 export function buildBoard(snapshot: Snapshot, settings: ModelSettings = SETTINGS): BoardRow[] {
-  const { multiple } = baseMultiple(snapshot, settings);
+  const multiples = categoryMultiples(snapshot, settings);
   const index = indexBySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   for (const slug of snapshot.watchlist) {
@@ -282,8 +364,9 @@ export function buildBoard(snapshot: Snapshot, settings: ModelSettings = SETTING
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const s = scoreProtocol(p, snapshot.as_of, multiple, settings);
-    return { p, ...s };
+    const eff = effectiveMultiple(p.category, multiples);
+    const s = scoreProtocol(p, snapshot.as_of, eff.multiple, settings);
+    return { p, ...s, categoryMultiple: eff.multiple, categorySample: eff.sample };
   });
   scored.sort(byRawDesc);
   const finalValues = enforceStrict(scored.map((s) => s.raw));
@@ -303,7 +386,10 @@ export function buildBoard(snapshot: Snapshot, settings: ModelSettings = SETTING
     age_days: s.age,
     implied_value_usd: finalValues[i]!,
     model: {
-      multiple,
+      multiple: s.categoryMultiple,
+      market_multiple: multiples.market.multiple,
+      category_multiple: s.categoryMultiple,
+      category_sample: s.categorySample,
       growth_pct: s.growthPct,
       growth_multiplier: s.growthMult,
       maturity_multiplier: s.maturityMult,
@@ -608,6 +694,8 @@ function dashboardRow(row: BoardRow): DashboardRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     reach_multiplier: row.model.reach_multiplier,
+    category_multiple: row.model.category_multiple,
+    category_sample: row.model.category_sample,
     farm_steps: row.farm_steps,
   };
 }
@@ -615,7 +703,7 @@ function dashboardRow(row: BoardRow): DashboardRow {
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, settings: ModelSettings = SETTINGS): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, settings);
-  const { multiple, sample } = baseMultiple(snapshot, settings);
+  const { market, byCategory } = categoryMultiples(snapshot, settings);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
@@ -624,8 +712,9 @@ export function buildRadar(snapshot: Snapshot, settings: ModelSettings = SETTING
     floor_usd: snapshot.floor_usd,
     model: settings,
     model_version: MODEL_VERSION,
-    multiple,
-    multiple_sample: sample,
+    multiple: market.multiple,
+    multiple_sample: market.sample,
+    category_multiples: Object.fromEntries([...byCategory.entries()].map(([c, v]) => [c, v])),
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
